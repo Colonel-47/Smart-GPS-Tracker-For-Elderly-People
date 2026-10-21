@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart GPS Tracker - Family Dashboard</title>
+<style>
+:root{--bg:#0B2B33;--panel:#0B3C49;--panel2:#124B5A;--teal:#02C39A;--teal2:#028090;--coral:#F96167;--gold:#F9C74F;--ink:#fff;--mute:#9CC5CC}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);font-family:Calibri,"Segoe UI",Arial,sans-serif;display:flex;flex-direction:column}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 22px;background:var(--panel)}
+header h1{font-size:20px}
+.right{display:flex;align-items:center;gap:10px}
+.chip{font-size:13px;background:var(--panel2);padding:6px 12px;border-radius:99px;color:var(--mute)}
+.chip b{color:var(--teal)}
+#modeBtn{padding:7px 14px;font-size:13px;border-radius:99px;background:var(--teal2)}
+main{flex:1;display:grid;grid-template-columns:1fr 340px;gap:16px;padding:16px;min-height:0}
+.map{position:relative;border-radius:14px;overflow:hidden;background:#0E3640;min-height:0}
+canvas{width:100%;height:100%;display:block}
+#banner{position:absolute;top:14px;left:14px;padding:10px 18px;border-radius:99px;font-weight:700;font-size:16px;background:var(--teal2)}
+#banner.alert{background:var(--coral);animation:blink .8s infinite}
+#banner.sos{background:#d11a2a;animation:blink .5s infinite}
+#banner.fall{background:#C026D3;animation:blink .6s infinite}
+@keyframes blink{50%{opacity:.55}}
+aside{display:flex;flex-direction:column;gap:12px;min-height:0}
+.card{background:var(--panel);border-radius:14px;padding:14px 16px}
+.status{font-size:26px;font-weight:700}
+.status.safe{color:var(--teal)}.status.alert{color:var(--coral)}.status.sos{color:#ff5a66}.status.fall{color:#E879F9}
+.row{display:flex;justify-content:space-between;font-size:15px;padding:4px 0;color:var(--mute)}
+.row b{color:var(--ink);font-variant-numeric:tabular-nums}
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button,select{font:inherit;font-weight:700;border:0;border-radius:10px;padding:11px;cursor:pointer;color:#fff;background:var(--teal2)}
+button:hover:not(:disabled){filter:brightness(1.15)}
+button:disabled,select:disabled{opacity:.35;cursor:not-allowed}
+#sosBtn{background:var(--coral);grid-column:span 2;font-size:18px;padding:14px}
+#resetBtn{background:var(--panel2)}
+select{background:var(--panel2);font-weight:400}
+.log{flex:1;overflow:auto;font-family:"Courier New",monospace;font-size:13px;line-height:1.6;min-height:90px}
+.log div{padding:2px 0;border-bottom:1px solid #ffffff12}
+.log .a{color:var(--gold)}.log .s{color:#ff6b75}.log .g{color:var(--teal)}
+.hint{font-size:13px;color:var(--mute)}
+@media(max-width:900px){main{grid-template-columns:1fr}.map{height:50vh}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Smart GPS Tracker &middot; Family Dashboard</h1>
+  <div class="right">
+    <div class="chip">Device: <b>ESP32</b> &middot; <b id="conn">Simulation</b> &middot; <span id="clock"></span></div>
+    <button id="modeBtn">Switch to Live (ESP32)</button>
+  </div>
+</header>
+<main>
+  <div class="map"><canvas id="cv"></canvas><div id="banner">Press Start to begin tracking</div></div>
+  <aside>
+    <div class="card">
+      <div class="hint">Status</div>
+      <div id="status" class="status safe">SAFE</div>
+      <div class="row">Latitude<b id="lat">-</b></div>
+      <div class="row">Longitude<b id="lon">-</b></div>
+      <div class="row">Distance from home<b id="dist">0 m</b></div>
+      <div class="row">Safe zone radius<b>200 m</b></div>
+    </div>
+    <div class="card btns">
+      <button id="startBtn">Start</button>
+      <button id="homeBtn">Return home</button>
+      <button id="sosBtn">SOS (elderly presses button)</button>
+      <button id="resetBtn">Reset</button>
+      <select id="speed" title="Speed"><option value="1">Speed 1x</option><option value="2">Speed 2x</option><option value="4">Speed 4x</option></select>
+    </div>
+    <div class="card log" id="log"><div class="hint">Event log</div></div>
+  </aside>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.3.5/dist/mqtt.min.js"></script>
+<script>
+// ---- Must match MQTT_TOPIC in the ESP32 sketch ----
+const TOPIC='smartgps-tn-4821/status';
+const BROKER='wss://broker.hivemq.com:8884/mqtt';
+
+const HOME={lat:34.7406,lon:10.7603}, R_SAFE=200, KX=Math.cos(HOME.lat*Math.PI/180)*111320, KY=110574;
+const $=id=>document.getElementById(id);
+const cv=$('cv'), ctx=cv.getContext('2d');
+let lat,lon,running=false,mode='away',trail,maxD,lastSt,sosUntil,timer,disp,audio,live=false,client=null,devState='SAFE';
+
+function toM(a,o){return {x:(o-HOME.lon)*KX, y:(a-HOME.lat)*KY}}
+function dist(){const p=toM(lat,lon);return Math.hypot(p.x,p.y)}
+function log(msg,cls){const d=document.createElement('div');if(cls)d.className=cls;d.textContent=new Date().toLocaleTimeString('en-GB')+'  '+msg;const L=$('log');L.insertBefore(d,L.children[1]||null)}
+function beep(f,ms){try{audio=audio||new (window.AudioContext||window.webkitAudioContext)();const o=audio.createOscillator(),g=audio.createGain();o.frequency.value=f;g.gain.value=.08;o.connect(g);g.connect(audio.destination);o.start();o.stop(audio.currentTime+ms/1000)}catch(e){}}
+function link(){return 'maps.google.com/?q='+lat.toFixed(5)+','+lon.toFixed(5)}
+
+function reset(){
+  clearInterval(timer);running=false;mode='away';lat=HOME.lat;lon=HOME.lon;trail=[{x:0,y:0}];maxD=0;lastSt='SAFE';sosUntil=0;disp={x:0,y:0};devState='SAFE';
+  $('startBtn').textContent='Start';$('log').innerHTML='<div class="hint">Event log</div>';
+  update();log(live?'Waiting for data from the ESP32...':'System ready. Tracker at home.','g');
+}
+function step(){
+  if(mode==='away'){lat+=0.0002;lon+=0.0001}
+  else{const p=toM(lat,lon),d=Math.hypot(p.x,p.y),s=Math.min(d,24);if(d>0.5){const nx=p.x-p.x/d*s,ny=p.y-p.y/d*s;lat=HOME.lat+ny/KY;lon=HOME.lon+nx/KX}}
+  trail.push(toM(lat,lon));maxD=Math.max(maxD,dist());update();
+}
+function update(){
+  const d=dist(),out=d>R_SAFE;
+  const st=live?devState:(Date.now()<sosUntil?'SOS':out?'ALERT':'SAFE');
+  const cls=st.toLowerCase();
+  $('lat').textContent=lat.toFixed(5);$('lon').textContent=lon.toFixed(5);$('dist').textContent=Math.round(d)+' m';
+  $('status').className='status '+cls;$('status').textContent=st;
+  const bn=$('banner');bn.className=st==='SAFE'?'':cls;
+  bn.textContent={SAFE:'Inside safe zone',ALERT:'Left the safe zone!',SOS:'SOS! Help needed',FALL:'Fall detected!'}[st];
+  if(running||live){
+    if(st!==lastSt){
+      if(st==='SAFE')log('Back inside the safe zone','g');
+      if(st==='ALERT')log('ALERT: left safe zone ('+Math.round(d)+' m)','a');
+      if(st==='SOS'){log('SOS! '+link(),'s');beep(2000,900)}
+      if(st==='FALL'){log('FALL DETECTED! '+link(),'s');beep(1500,900)}
+    }
+    if(st==='ALERT')beep(1000,250);
+  }
+  lastSt=st;
+}
+function sos(){sosUntil=Date.now()+5000;update();setTimeout(update,5100)}
+function start(){
+  if(running){clearInterval(timer);running=false;$('startBtn').textContent='Resume';return}
+  running=true;$('startBtn').textContent='Pause';
+  timer=setInterval(step,1000/Number($('speed').value));
+  log('Tracking started','g');
+}
+function lockControls(lock){['startBtn','homeBtn','sosBtn','speed'].forEach(i=>$(i).disabled=lock)}
+
+function goLive(){
+  if(typeof mqtt==='undefined'){alert('MQTT library could not load (no internet). Staying in simulation mode.');return}
+  live=true;lockControls(true);reset();
+  $('modeBtn').textContent='Switch to Simulation';$('conn').textContent='Live: connecting...';
+  client=mqtt.connect(BROKER,{reconnectPeriod:3000});
+  client.on('connect',()=>{client.subscribe(TOPIC);$('conn').textContent='Live: connected';log('Connected to MQTT broker','g')});
+  client.on('reconnect',()=>{$('conn').textContent='Live: reconnecting...'});
+  client.on('error',()=>{$('conn').textContent='Live: error'});
+  client.on('message',(t,m)=>{
+    try{
+      const j=JSON.parse(m.toString());
+      lat=j.lat;lon=j.lon;devState=j.state||'SAFE';
+      trail.push(toM(lat,lon));maxD=Math.max(maxD,dist());
+      $('conn').textContent='Live: receiving';update();
+    }catch(e){}
+  });
+}
+function goSim(){
+  live=false;if(client){client.end(true);client=null}
+  lockControls(false);$('modeBtn').textContent='Switch to Live (ESP32)';$('conn').textContent='Simulation';reset();
+}
+$('modeBtn').onclick=()=>live?goSim():goLive();
+$('startBtn').onclick=start;$('resetBtn').onclick=reset;$('sosBtn').onclick=sos;
+$('homeBtn').onclick=()=>{mode='home';log('Elderly person is heading home','g');if(!running)start()};
+$('speed').onchange=()=>{if(running){clearInterval(timer);timer=setInterval(step,1000/Number($('speed').value))}};
+
+function size(){const r=cv.getBoundingClientRect(),k=devicePixelRatio||1;cv.width=r.width*k;cv.height=r.height*k;ctx.setTransform(k,0,0,k,0,0)}
+addEventListener('resize',size);
+
+function draw(){
+  const W=cv.clientWidth,H=cv.clientHeight,R=Math.max(280,maxD+90),sc=Math.min(W,H)/2/R*0.95;
+  const cx=W/2,cy=H/2,X=x=>cx+x*sc,Y=y=>cy-y*sc;
+  ctx.clearRect(0,0,W,H);
+  ctx.lineWidth=1;
+  for(let m=-1500;m<=1500;m+=50){const big=m%100===0;ctx.strokeStyle=big?'#ffffff16':'#ffffff0a';
+    ctx.beginPath();ctx.moveTo(X(m),0);ctx.lineTo(X(m),H);ctx.stroke();ctx.beginPath();ctx.moveTo(0,Y(m));ctx.lineTo(W,Y(m));ctx.stroke()}
+  ctx.beginPath();ctx.arc(X(0),Y(0),R_SAFE*sc,0,7);ctx.fillStyle='#02C39A22';ctx.fill();
+  ctx.setLineDash([8,6]);ctx.strokeStyle='#02C39A';ctx.lineWidth=2;ctx.stroke();ctx.setLineDash([]);
+  ctx.fillStyle='#fff';ctx.fillRect(X(0)-8,Y(0)-8,16,16);ctx.fillStyle='#0B3C49';ctx.font='bold 11px sans-serif';ctx.textAlign='center';ctx.fillText('H',X(0),Y(0)+4);
+  ctx.fillStyle='#9CC5CC';ctx.font='13px sans-serif';ctx.fillText('Home',X(0),Y(0)+26);
+  ctx.fillText('Safe zone (200 m)',X(0),Y(-R_SAFE)+20);
+  ctx.strokeStyle='#F9C74F';ctx.lineWidth=3;ctx.beginPath();trail.forEach((p,i)=>i?ctx.lineTo(X(p.x),Y(p.y)):ctx.moveTo(X(p.x),Y(p.y)));ctx.stroke();
+  const t=trail[trail.length-1];disp.x+=(t.x-disp.x)*.12;disp.y+=(t.y-disp.y)*.12;
+  const col={SAFE:'#02C39A',ALERT:'#F96167',SOS:'#ff2b3b',FALL:'#E879F9'}[lastSt]||'#02C39A',pulse=(Date.now()%1000)/1000;
+  ctx.beginPath();ctx.arc(X(disp.x),Y(disp.y),10+pulse*18,0,7);ctx.strokeStyle=col;ctx.globalAlpha=1-pulse;ctx.lineWidth=2;ctx.stroke();ctx.globalAlpha=1;
+  ctx.beginPath();ctx.arc(X(disp.x),Y(disp.y),9,0,7);ctx.fillStyle=col;ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+  ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(18,H-22);ctx.lineTo(18+100*sc,H-22);ctx.stroke();
+  ctx.fillStyle='#fff';ctx.textAlign='left';ctx.fillText('100 m',18,H-30);
+  requestAnimationFrame(draw);
+}
+setInterval(()=>$('clock').textContent=new Date().toLocaleTimeString('en-GB'),500);
+size();reset();draw();
+</script>
+</body>
+</html>
